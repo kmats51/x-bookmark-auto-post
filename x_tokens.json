@@ -1,0 +1,9 @@
+{
+  "access_token": "RThlaUtlNHRGU3NsTERBbmdIU3J1eFBSYml5NW5sSWNuNmxhR29FTkN4ajJyOjE3Nzg4MzU2MDI2NjI6MToxOmF0OjE",
+  "refresh_token": "NXctU2kxTnhwbHE0dlhZbS1sS1dOUi1JalVRNVhKV1EwaU5qaUxlM1BQVWRYOjE3Nzg4MzU2MDI2NjI6MTowOnJ0OjE",
+  "expires_at": 1778842802.803151,
+  "user_id": "795901118593179652",
+  "username": "imakentei",
+  "name": "IMA検定｜WEBマーケ実践ノウハウ検定",
+  "scope": "offline.access bookmark.read tweet.write users.read tweet.read"
+}
