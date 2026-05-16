@@ -2,8 +2,8 @@ name: Xブックマーク自動引用投稿
 
 on:
   schedule:
-    # JST 18:00 = UTC 09:00
-    - cron: '0 9 * * *'
+    # JST 12:00 = UTC 03:00 / JST 18:00 = UTC 09:00
+    - cron: '0 3,9 * * *'
   workflow_dispatch:
 
 permissions:
