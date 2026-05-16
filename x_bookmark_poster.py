@@ -16,11 +16,14 @@ import asyncio
 import hashlib
 import base64
 import secrets
-import psycopg2
 import httpx
 from datetime import datetime, timezone
 from pathlib import Path
+import time
+import asyncio
 from dotenv import load_dotenv
+from playwright.async_api import async_playwright
+import tweepy
 
 load_dotenv()
 
@@ -28,10 +31,19 @@ load_dotenv()
 X_CLIENT_ID     = os.environ.get("X_CLIENT_ID", "")
 X_CLIENT_SECRET = os.environ.get("X_CLIENT_SECRET", "")
 X_REDIRECT_URI  = os.environ.get("X_REDIRECT_URI", "http://localhost:5000/callback")
+
+X_API_KEY       = os.environ.get("X_API_KEY", "")
+X_API_SECRET    = os.environ.get("X_API_SECRET", "")
+X_ACCESS_TOKEN  = os.environ.get("X_ACCESS_TOKEN", "")
+X_ACCESS_SECRET = os.environ.get("X_ACCESS_SECRET", "")
+
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 TOKENS_FILE      = Path(__file__).parent / "x_tokens.json"
+PROCESSED_FILE   = Path(__file__).parent / "processed_tweets.json"
+USER_DATA_DIR    = Path(__file__).parent / "user_data"
 MAX_POSTS_PER_RUN = 3
 
 X_API_BASE  = "https://api.twitter.com/2"
@@ -144,31 +156,31 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> dict:
     if "access_token" not in data:
         raise RuntimeError(f"トークン取得失敗: {data}")
     return data
+    
 
-
-# ── DB 操作 ──────────────────────────────────────────
-def _db_connect():
-    return psycopg2.connect(
-        host="127.0.0.1",
-        port=5432,
-        dbname="sv_portal_db",
-        user="sv_admin",
-        password="sv_password",
-    )
-
-
-def get_processed_tweet_ids() -> set:
-    """処理済みツイート ID のセットを DB から取得する。"""
+# ── Slack 通知 ──────────────────────────────────────
+def send_slack_notification(message: str) -> None:
+    """Slack Incoming Webhook で通知を送信する。"""
+    if not SLACK_WEBHOOK_URL:
+        return
     try:
-        conn = _db_connect()
-        cur  = conn.cursor()
-        cur.execute("SELECT tweet_id FROM x_bookmark_posts")
-        ids = {row[0] for row in cur.fetchall()}
-        cur.close()
-        conn.close()
-        return ids
+        import requests
+        requests.post(SLACK_WEBHOOK_URL, json={"text": message}, timeout=10)
     except Exception as e:
-        print(f"[x_bookmark] DB 読み込みエラー: {e}")
+        print(f"[x_bookmark] Slack 通知エラー: {e}")
+
+
+# ── JSON 操作 (DBの代わり) ──────────────────────────────────
+def get_processed_tweet_ids() -> set:
+    """処理済みツイート ID のセットを JSON から取得する。"""
+    if not PROCESSED_FILE.exists():
+        return set()
+    try:
+        data = json.loads(PROCESSED_FILE.read_text(encoding="utf-8"))
+        # キー（tweet_id）の集合を返す
+        return set(data.keys())
+    except Exception as e:
+        print(f"[x_bookmark] JSON 読み込みエラー: {e}")
         return set()
 
 
@@ -180,83 +192,103 @@ def save_bookmark_post(
     commentary: str,
     post_tweet_id: str,
 ) -> None:
-    """投稿記録を DB に保存する。"""
+    """投稿記録を JSON に保存する。"""
     try:
-        conn = _db_connect()
-        cur  = conn.cursor()
-        cur.execute(
-            """INSERT INTO x_bookmark_posts
-               (tweet_id, tweet_text, author_username, tweet_url, commentary, post_tweet_id, status)
-               VALUES (%s, %s, %s, %s, %s, %s, 'posted')
-               ON CONFLICT (tweet_id) DO NOTHING""",
-            (tweet_id, tweet_text, author_username, tweet_url, commentary, post_tweet_id),
+        # 既存のデータを読み込み
+        data = {}
+        if PROCESSED_FILE.exists():
+            data = json.loads(PROCESSED_FILE.read_text(encoding="utf-8"))
+        
+        # 新しいデータを追加
+        data[tweet_id] = {
+            "tweet_text": tweet_text,
+            "author_username": author_username,
+            "tweet_url": tweet_url,
+            "commentary": commentary,
+            "post_tweet_id": post_tweet_id,
+            "processed_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # ファイルに書き込み
+        PROCESSED_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        conn.commit()
-        cur.close()
-        conn.close()
     except Exception as e:
-        print(f"[x_bookmark] DB 保存エラー: {e}")
+        print(f"[x_bookmark] JSON 保存エラー: {e}")
 
 
-def get_recent_posts(limit: int = 20) -> list:
-    """最近の投稿履歴を DB から取得する。"""
-    try:
-        conn = _db_connect()
-        cur  = conn.cursor()
-        cur.execute(
-            """SELECT tweet_id, author_username, commentary, post_tweet_id, status, processed_at
-               FROM x_bookmark_posts
-               ORDER BY processed_at DESC
-               LIMIT %s""",
-            (limit,),
+# ── X スクレイピング (Bookmark 取得用) ──────────────────
+async def fetch_bookmarks_scraping(limit: int = 20) -> list:
+    """Playwright を使ってブックマーク一覧を取得する。"""
+    bookmarks = []
+    
+    async with async_playwright() as p:
+        # persistent_context を使用してログイン情報を保持
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(USER_DATA_DIR),
+            headless=True,  # 安定したら True に
+            viewport={"width": 1280, "height": 800}
         )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return [
-            {
-                "tweet_id":        r[0],
-                "author_username": r[1],
-                "commentary":      r[2],
-                "post_tweet_id":   r[3],
-                "status":          r[4],
-                "processed_at":    r[5].isoformat() if r[5] else None,
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        print(f"[x_bookmark] DB 履歴取得エラー: {e}")
-        return []
+        
+        page = await context.new_page()
+        print("[x_bookmark] ブックマークページにアクセス中...")
+        await page.goto("https://x.com/i/bookmarks", wait_until="domcontentloaded", timeout=60000)
+        
+        # ログインチェック (ログイン画面が表示されたら中断)
+        if "login" in page.url:
+            await context.close()
+            raise RuntimeError("X へのログインが必要です。user_data 内にセッションがありません。")
 
-
-# ── X API 呼び出し ────────────────────────────────────
-async def fetch_bookmarks(access_token: str, user_id: str) -> list:
-    """X API v2 からブックマーク一覧を取得する。"""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{X_API_BASE}/users/{user_id}/bookmarks",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={
-                "tweet.fields": "id,text,created_at,author_id",
-                "expansions":   "author_id",
-                "user.fields":  "username,name",
-                "max_results":  100,
-            },
-        )
-
-    data = resp.json()
-    if resp.status_code != 200:
-        raise RuntimeError(f"ブックマーク取得失敗 ({resp.status_code}): {data}")
-
-    tweets = data.get("data", [])
-    users  = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
-
-    for tweet in tweets:
-        author = users.get(tweet.get("author_id", ""), {})
-        tweet["author_username"] = author.get("username", "unknown")
-        tweet["author_name"]     = author.get("name", "")
-
-    return tweets
+        # 少し待機して要素を読み込み
+        await asyncio.sleep(5)
+        
+        # ツイート要素の抽出
+        articles = await page.locator('article[data-testid="tweet"]').all()
+        print(f"[x_bookmark] {len(articles)} 件のツイート要素を検出")
+        
+        for article in articles[:limit]:
+            try:
+                # テキスト
+                text_els = article.locator('[data-testid="tweetText"]').first
+                text = await text_els.inner_text() if await text_els.count() > 0 else ""
+                
+                # テキストが取得できなかった場合のフォールバック（リンクカードのタイトルなど）
+                if not text:
+                    # カードタイトルや、その他の dir="auto" の要素を探す
+                    card_title_els = article.locator('[data-testid="card.layoutLarge.detail"] div').first
+                    if await card_title_els.count() > 0:
+                        text = await card_title_els.inner_text()
+                    else:
+                        # 最後の手段として、記事内の主要なテキストっぽいものを探す
+                        other_text_els = article.locator('div[dir="auto"]').first
+                        if await other_text_els.count() > 0:
+                            text = await other_text_els.inner_text()
+                
+                # URL
+                tweet_url = ""
+                links = await article.locator('a[href*="/status/"]').all()
+                for a in links:
+                    href = await a.get_attribute("href") or ""
+                    if "/status/" in href and "/photo/" not in href and "/video/" not in href:
+                        # href は /username/status/12345 の形式
+                        tweet_id = href.split("/")[-1]
+                        author_username = href.split("/")[1]
+                        tweet_url = f"https://x.com{href}"
+                        break
+                
+                if text and tweet_url:
+                    bookmarks.append({
+                        "id": tweet_id,
+                        "text": text,
+                        "author_username": author_username,
+                        "author_name": "", # スクレイピングでは一旦空
+                    })
+            except Exception as e:
+                continue
+        
+        await context.close()
+        
+    return bookmarks
 
 
 async def fetch_my_user_id(access_token: str) -> tuple[str, str]:
@@ -275,23 +307,54 @@ async def fetch_my_user_id(access_token: str) -> tuple[str, str]:
     return data["data"]["id"], data["data"]["username"]
 
 
-async def post_quote_tweet(access_token: str, commentary: str, quote_tweet_id: str) -> str:
-    """引用ツイートを投稿してツイート ID を返す。"""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{X_API_BASE}/tweets",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type":  "application/json",
-            },
-            json={"text": commentary, "quote_tweet_id": quote_tweet_id},
+async def post_tweet_scraping(commentary: str, tweet_url: str) -> str:
+    """Playwright を使ってブラウザ上で『引用ツイート』を行う。"""
+    import urllib.parse
+    
+    # 投稿用テキストをエンコード
+    encoded_text = urllib.parse.quote(commentary)
+    encoded_url = urllib.parse.quote(tweet_url)
+    
+    post_id = f"scraped_{int(time.time())}"
+    
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(USER_DATA_DIR),
+            headless=True,
+            viewport={"width": 1280, "height": 800}
         )
-
-    data = resp.json()
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"ツイート投稿失敗 ({resp.status_code}): {data}")
-
-    return data["data"]["id"]
+        page = await context.new_page()
+        
+        try:
+            # 共有 Intent URL を使用 (これが一番確実)
+            intent_url = f"https://x.com/intent/post?text={encoded_text}&url={encoded_url}"
+            print(f"[x_bookmark] 引用投稿(Intent)にアクセス中...")
+            await page.goto(intent_url, wait_until="domcontentloaded", timeout=60000)
+            
+            # 投稿ボタンの待機
+            # Intent画面では [data-testid="tweetButton"] が最初からある場合が多い
+            post_button = page.locator('button[data-testid="tweetButton"]').first
+            await post_button.wait_for(timeout=30000)
+            
+            # 少し待機して X 側が URL を引用カードとして認識するのを待つ
+            await asyncio.sleep(5)
+            
+            # 投稿
+            await post_button.click()
+            
+            print("[x_bookmark] 引用ツイート完了を待機中...")
+            await asyncio.sleep(5)
+            
+        except Exception as e:
+            print(f"[x_bookmark] 引用投稿エラー: {e}")
+            # エラー時のみデバッグ用スクショ
+            await page.screenshot(path="debug_intent_error.png")
+            await context.close()
+            raise e
+            
+        await context.close()
+        
+    return post_id
 
 
 # ── Gemini コメント生成 ──────────────────────────────
@@ -309,8 +372,9 @@ async def generate_commentary(
 - 日本語でコメントしてください
 - 投稿の要点や気づき・解説を自分の言葉で簡潔に書いてください
 - 220文字以内に収めてください
-- 自然な口調（「〜ですね」「〜だと思います」など）で書いてください
-- 絵文字を適度に使ってOKです
+- プロフェッショナルが専門的な知見から分かりやすく解説する、落ち着いた知的なトーンにしてください
+- くだけすぎた表現（「〜だね！」「〜かな？」など）は避け、丁寧ながらも自信を感じさせる口調にしてください
+- 絵文字は多用せず、最小限（または無し）にしてください
 - 「この投稿は〜」のような言い回しは避けてください"""
 
     url = (
@@ -371,10 +435,10 @@ async def run_bookmark_poster() -> dict:
             print(f"[x_bookmark] ユーザー情報取得失敗: {e}")
             return {"status": "error", "message": str(e), "posted": 0}
 
-    # 2. ブックマーク取得
+    # 2. ブックマーク取得 (スクレイピング方式)
     try:
-        bookmarks = await fetch_bookmarks(access_token, user_id)
-    except RuntimeError as e:
+        bookmarks = await fetch_bookmarks_scraping(limit=20)
+    except Exception as e:
         print(f"[x_bookmark] ブックマーク取得エラー: {e}")
         return {"status": "error", "message": str(e), "posted": 0}
 
@@ -395,20 +459,24 @@ async def run_bookmark_poster() -> dict:
         tweet_text      = tweet["text"]
         author_username = tweet.get("author_username", "unknown")
         author_name     = tweet.get("author_name", "")
-        tweet_url       = f"https://twitter.com/{author_username}/status/{tweet_id}"
+        tweet_url       = f"https://x.com/{author_username}/status/{tweet_id}"
 
         try:
             # 4. コメント生成
             commentary = await generate_commentary(tweet_text, author_name, author_username)
             print(f"[x_bookmark] コメント生成: {commentary[:60]}…")
 
-            # 5. 引用ツイート投稿
-            post_id = await post_quote_tweet(access_token, commentary, tweet_id)
+            # 5. ブラウザ自動操作で投稿 (API制限を完全に回避)
+            post_id = await post_tweet_scraping(commentary, tweet_url)
 
             # 6. DB 保存
             save_bookmark_post(
                 tweet_id, tweet_text, author_username, tweet_url, commentary, post_id
             )
+
+            # 7. Slack 通知
+            msg = f"🔖 【Xブックマーク自動投稿】\n元のツイート: {tweet_url}\n解説内容: {commentary}\n投稿ステータス: 成功"
+            send_slack_notification(msg)
 
             posted.append({
                 "original_tweet_id":  tweet_id,
@@ -424,6 +492,11 @@ async def run_bookmark_poster() -> dict:
         except Exception as e:
             msg = f"tweet_id={tweet_id} の処理失敗: {e}"
             print(f"[x_bookmark] エラー: {msg}")
+            
+            # エラー時も Slack に通知
+            err_msg = f"⚠️ 【Xブックマーク自動投稿エラー】\n対象URL: {tweet_url}\n内容: {msg}"
+            send_slack_notification(err_msg)
+            
             errors.append(msg)
             continue
 

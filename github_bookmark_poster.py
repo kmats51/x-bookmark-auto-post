@@ -32,7 +32,7 @@ X_API_SECRET      = os.environ.get("X_API_SECRET", "")
 X_ACCESS_TOKEN    = os.environ.get("X_ACCESS_TOKEN", "")
 X_ACCESS_SECRET   = os.environ.get("X_ACCESS_SECRET", "")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 TOKENS_FILE    = BASE_DIR / "x_tokens.json"
