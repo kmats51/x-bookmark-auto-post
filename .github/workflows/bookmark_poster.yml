@@ -23,7 +23,8 @@ jobs:
           python-version: '3.11'
 
       - name: 実行時刻を確認
-        run: echo "JST: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S')"
+        run: |
+          echo "JST: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S')"
 
       - name: 依存ライブラリをインストール
         run: pip install -r requirements.txt
